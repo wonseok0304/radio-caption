@@ -1,18 +1,21 @@
-"""파이프라인 실행 모듈 — STT+화자분리 → 음향 분석 → 감정 태깅을 결합하여 최종 JSON 생성."""
+"""파이프라인 실행 모듈 — 배치(파일)와 스트리밍(URL) 두 모드를 제공한다."""
 
 import json
 import logging
 import os
 import tempfile
 import time
+import wave
+from collections.abc import Generator
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from backend.audio.analyzer import analyze
 from backend.llm.emotion_tagger import tag_emotions
+from backend.pipeline.stream import stream_radio
 from backend.schemas.word_schema import Sentence
-from backend.stt.assemblyai_transcriber import transcribe_with_speaker
+from backend.stt.transcriber import transcribe_stream
 
 load_dotenv()
 
@@ -20,6 +23,86 @@ OUTPUT_DIR: Path = Path(os.getenv("OUTPUT_DIR", "data/outputs"))
 
 logger = logging.getLogger(__name__)
 
+_SR: int = 16000
+_CHANNELS: int = 1
+_SAMPLE_WIDTH: int = 2  # 16-bit PCM
+
+
+# ---------------------------------------------------------------------------
+# 스트리밍 파이프라인
+# ---------------------------------------------------------------------------
+
+def run_stream(url: str) -> Generator[dict, None, None]:
+    """라디오 스트림 URL을 청크 단위로 처리하고 Sentence 구조 dict를 yield한다.
+
+    처리 순서: stream_radio → transcribe_stream → analyze → tag_emotions
+
+    각 청크에서 발생한 단계별 오류는 경고 로그를 남기고 해당 청크를 건너뛴다.
+    sentence_id는 스트림 전체에 걸쳐 단조 증가한다.
+
+    Args:
+        url: 라디오 스트림 URL (http/https/rtmp 등 ffmpeg 지원 스킴)
+
+    Yields:
+        dict: Sentence 스키마에 맞는 dict
+              (sentence_id, speaker, text, words[word, timestamp_start,
+               timestamp_end, emotion, volume_level, pitch_level])
+
+    Raises:
+        OSError: ffmpeg 실행 파일을 찾을 수 없을 때
+    """
+    sentence_counter: int = 0
+
+    for chunk_idx, audio_chunk in enumerate(stream_radio(url), start=1):
+        logger.info("청크 #%d 처리 시작 (%d bytes)", chunk_idx, len(audio_chunk))
+
+        # 1단계: STT
+        try:
+            word_timestamps: list[dict] = transcribe_stream(audio_chunk)
+        except Exception as e:
+            logger.warning("청크 #%d STT 실패, 건너뜀: %s", chunk_idx, e)
+            continue
+
+        if not word_timestamps:
+            logger.debug("청크 #%d: STT 결과 없음, 건너뜀", chunk_idx)
+            continue
+
+        # analyzer.py는 파일 경로를 받으므로 임시 WAV로 변환
+        tmp_wav = _pcm_to_temp_wav(audio_chunk)
+        try:
+            # 2단계: 음향 분석
+            try:
+                analyzed_words: list[dict] = analyze(str(tmp_wav), word_timestamps)
+            except Exception as e:
+                logger.warning("청크 #%d 음향 분석 실패, 건너뜀: %s", chunk_idx, e)
+                continue
+
+            # 3단계: 감정 태깅
+            try:
+                raw_sentences: list[dict] = tag_emotions(analyzed_words)
+            except Exception as e:
+                logger.warning("청크 #%d 감정 추론 실패, 건너뜀: %s", chunk_idx, e)
+                continue
+        finally:
+            tmp_wav.unlink(missing_ok=True)
+
+        # 4단계: Pydantic 검증 후 yield
+        for raw in raw_sentences:
+            sentence_counter += 1
+            raw = {**raw, "sentence_id": sentence_counter}
+            try:
+                yield Sentence.model_validate(raw).model_dump()
+            except Exception as e:
+                logger.warning(
+                    "청크 #%d 스키마 검증 실패 (sentence_id=%d): %s",
+                    chunk_idx, sentence_counter, e,
+                )
+                yield raw
+
+
+# ---------------------------------------------------------------------------
+# 배치 파이프라인 (기존 유지)
+# ---------------------------------------------------------------------------
 
 def run(video_path: str | Path) -> list[dict]:
     """영상 파일을 받아 AssemblyAI STT+화자분리 → 음향 분석 → 감정 태깅을 순서대로 실행한다.
@@ -34,6 +117,8 @@ def run(video_path: str | Path) -> list[dict]:
         FileNotFoundError: video_path가 존재하지 않을 때
         RuntimeError: 각 단계 실패 시 (어느 단계인지 메시지에 포함)
     """
+    from backend.stt.assemblyai_transcriber import transcribe_with_speaker  # 런타임 의존성
+
     video_path = Path(video_path)
     if not video_path.exists():
         raise FileNotFoundError(f"영상 파일을 찾을 수 없습니다: {video_path}")
@@ -79,7 +164,10 @@ def run(video_path: str | Path) -> list[dict]:
 
     validated = _validate(final_result)
 
-    logger.info("파이프라인 완료: 총 %d개 문장, 전체 소요 %.1f초", len(validated), time.time() - pipeline_start)
+    logger.info(
+        "파이프라인 완료: 총 %d개 문장, 전체 소요 %.1f초",
+        len(validated), time.time() - pipeline_start,
+    )
     return validated
 
 
@@ -92,9 +180,31 @@ def save_result(result: list[dict], output_path: str) -> None:
     logger.info("결과 저장 완료: %s", path)
 
 
+# ---------------------------------------------------------------------------
+# 내부 헬퍼
+# ---------------------------------------------------------------------------
+
+def _pcm_to_temp_wav(pcm_bytes: bytes) -> Path:
+    """s16le raw PCM bytes를 16kHz mono WAV 임시 파일로 변환한다.
+
+    analyzer.py가 파일 경로를 요구하므로 스트리밍 경로에서만 사용한다.
+    """
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
+    tmp_path = Path(tmp.name)
+
+    with wave.open(str(tmp_path), "wb") as wf:
+        wf.setnchannels(_CHANNELS)
+        wf.setsampwidth(_SAMPLE_WIDTH)
+        wf.setframerate(_SR)
+        wf.writeframes(pcm_bytes)
+
+    return tmp_path
+
+
 def _extract_audio(video_path: Path) -> Path:
     """ffmpeg로 영상에서 16kHz mono WAV를 임시 파일로 추출한다."""
-    import ffmpeg
+    import ffmpeg  # 런타임 의존성 — 테스트 시 모킹 가능
 
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp.close()
@@ -133,12 +243,21 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     if len(sys.argv) < 2:
-        print("사용법: python -m backend.pipeline.runner <video_path>")
+        print("사용법:")
+        print("  배치: python -m backend.pipeline.runner <video_path>")
+        print("  스트림: python -m backend.pipeline.runner --stream <url>")
         sys.exit(1)
 
-    _video_path = sys.argv[1]
-    _result = run(_video_path)
-
-    _output_path = f"data/outputs/{Path(_video_path).stem}_result.json"
-    save_result(_result, _output_path)
-    print(f"결과 저장 완료: {_output_path}")
+    if sys.argv[1] == "--stream":
+        if len(sys.argv) < 3:
+            print("스트림 URL을 입력하세요.")
+            sys.exit(1)
+        _url = sys.argv[2]
+        for _sentence in run_stream(_url):
+            print(json.dumps(_sentence, ensure_ascii=False))
+    else:
+        _video_path = sys.argv[1]
+        _result = run(_video_path)
+        _output_path = f"data/outputs/{Path(_video_path).stem}_result.json"
+        save_result(_result, _output_path)
+        print(f"결과 저장 완료: {_output_path}")
