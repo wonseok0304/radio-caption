@@ -4,8 +4,9 @@ import asyncio
 import logging
 import threading
 
+import requests as req
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -43,46 +44,16 @@ class Channel(BaseModel):
 # ---------------------------------------------------------------------------
 
 _CHANNELS: list[Channel] = [
-    Channel(
-        id="kbs1",
-        name="KBS 1라디오",
-        url="http://kbs-radio1-live.cdn.cloudn.net/kbs-radio1-live/master.m3u8",
-    ),
-    Channel(
-        id="kbs_coolfm",
-        name="KBS 쿨FM",
-        url="http://kbs-coolfm-live.cdn.cloudn.net/kbs-coolfm-live/master.m3u8",
-    ),
-    Channel(
-        id="kbs_classicfm",
-        name="KBS 클래식FM",
-        url="http://kbs-classicfm-live.cdn.cloudn.net/kbs-classicfm-live/master.m3u8",
-    ),
-    Channel(
-        id="mbc_fm4u",
-        name="MBC FM4U",
-        url="https://cprog-fm.imbc.com/FM4UFMAAC",
-    ),
-    Channel(
-        id="mbc_sfm",
-        name="MBC 표준FM",
-        url="https://cprog-am.imbc.com/SFMFMAAC",
-    ),
-    Channel(
-        id="sbs_powerfm",
-        name="SBS Power FM",
-        url="https://aac-pf.sbs.co.kr/audiostream/powerFM",
-    ),
-    Channel(
-        id="sbs_lovefm",
-        name="SBS Love FM",
-        url="https://aac-pf.sbs.co.kr/audiostream/loveFM",
-    ),
-    Channel(
-        id="ebs_fm",
-        name="EBS FM",
-        url="https://ebsradio.ebs.co.kr/EBSFM/playlist.m3u8",
-    ),
+    Channel(id="kbs_classic",  name="KBS 클래식FM",    url="https://radio.bsod.kr/stream/?stn=kbs&ch=1fm"),
+    Channel(id="kbs_coolfm",   name="KBS 쿨FM",        url="https://radio.bsod.kr/stream/?stn=kbs&ch=2fm"),
+    Channel(id="kbs_1radio",   name="KBS 1라디오",     url="https://radio.bsod.kr/stream/?stn=kbs&ch=1radio"),
+    Channel(id="kbs_happyfm",  name="KBS 해피FM",      url="https://radio.bsod.kr/stream/?stn=kbs&ch=2radio&bora=true"),
+    Channel(id="mbc_fm4u",     name="MBC FM4U",        url="https://radio.bsod.kr/stream/?stn=mbc&ch=chm"),
+    Channel(id="cbs_musicfm",  name="CBS 음악FM",      url="https://m-aac.cbs.co.kr/mweb_cbs939/_definst_/cbs939.stream/playlist.m3u8"),
+    Channel(id="ytn_radio",    name="YTN 라디오",      url="https://radiolive.ytn.co.kr/radio/_definst_/20211118_fmlive/playlist.m3u8"),
+    Channel(id="tbs_fm",       name="TBS FM 95.1",     url="https://cdnfm.tbs.seoul.kr/tbs/_definst_/tbs_fm_web_360.smil/chunklist.m3u8"),
+    Channel(id="obs_radio",    name="OBS 라디오",      url="https://vod3.obs.co.kr:444/live/obsstream1/radio.stream/playlist.m3u8"),
+    Channel(id="arirang",      name="Arirang Radio",   url="http://amdlive.ctnd.com.edgesuite.net/arirang_3ch/smil:arirang_3ch.smil/playlist.m3u8"),
 ]
 
 
@@ -94,6 +65,62 @@ _CHANNELS: list[Channel] = [
 async def get_channels() -> list[Channel]:
     """한국 주요 라디오 채널 목록을 반환한다."""
     return _CHANNELS
+
+
+@app.get("/api/channels/search", response_model=list[Channel])
+async def search_channels(
+    q: str = Query(default=""),
+    tag: str = Query(default=""),
+    language: str = Query(default=""),
+) -> list[Channel]:
+    """Radio Browser API로 한국 라디오 채널을 검색한다.
+
+    q, tag, language 중 입력된 값만 API 파라미터에 포함된다.
+    세 값이 모두 비어있으면 빈 목록을 반환한다.
+    """
+    if not any([q.strip(), tag.strip(), language.strip()]):
+        return []
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, _fetch_radio_browser, q.strip(), tag.strip(), language.strip()
+    )
+
+
+def _fetch_radio_browser(q: str, tag: str, language: str) -> list[Channel]:
+    """Radio Browser API를 동기 호출하고 Channel 목록으로 변환한다."""
+    params: dict = {
+        "countrycode": "KR",
+        "hidebroken": "true",
+        "limit": 20,
+        "order": "votes",
+    }
+    if q:
+        params["name"] = q
+    if tag:
+        params["tag"] = tag
+    if language:
+        params["language"] = language
+
+    try:
+        resp = req.get(
+            "https://de1.api.radio-browser.info/json/stations/search",
+            params=params,
+            headers={"User-Agent": "radio-caption/0.1"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return [
+            Channel(
+                id=s["stationuuid"],
+                name=s["name"].strip(),
+                url=s.get("url_resolved") or s["url"],
+            )
+            for s in resp.json()
+            if s.get("url_resolved") or s.get("url")
+        ]
+    except Exception as exc:
+        logger.warning("Radio Browser API 오류: %s", exc)
+        return []
 
 
 # ---------------------------------------------------------------------------

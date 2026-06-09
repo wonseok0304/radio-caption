@@ -12,7 +12,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from backend.audio.analyzer import analyze
-from backend.llm.emotion_tagger import tag_emotions
 from backend.pipeline.stream import stream_radio
 from backend.schemas.word_schema import Sentence
 from backend.stt.transcriber import transcribe_stream
@@ -35,7 +34,7 @@ _SAMPLE_WIDTH: int = 2  # 16-bit PCM
 def run_stream(url: str) -> Generator[dict, None, None]:
     """라디오 스트림 URL을 청크 단위로 처리하고 Sentence 구조 dict를 yield한다.
 
-    처리 순서: stream_radio → transcribe_stream → analyze → tag_emotions
+    처리 순서: stream_radio → transcribe_stream → analyze → Sentence 변환
 
     각 청크에서 발생한 단계별 오류는 경고 로그를 남기고 해당 청크를 건너뛴다.
     sentence_id는 스트림 전체에 걸쳐 단조 증가한다.
@@ -46,7 +45,7 @@ def run_stream(url: str) -> Generator[dict, None, None]:
     Yields:
         dict: Sentence 스키마에 맞는 dict
               (sentence_id, speaker, text, words[word, timestamp_start,
-               timestamp_end, emotion, volume_level, pitch_level])
+               timestamp_end, volume_level, pitch_level])
 
     Raises:
         OSError: ffmpeg 실행 파일을 찾을 수 없을 때
@@ -76,28 +75,20 @@ def run_stream(url: str) -> Generator[dict, None, None]:
             except Exception as e:
                 logger.warning("청크 #%d 음향 분석 실패, 건너뜀: %s", chunk_idx, e)
                 continue
-
-            # 3단계: 감정 태깅
-            try:
-                raw_sentences: list[dict] = tag_emotions(analyzed_words)
-            except Exception as e:
-                logger.warning("청크 #%d 감정 추론 실패, 건너뜀: %s", chunk_idx, e)
-                continue
         finally:
             tmp_wav.unlink(missing_ok=True)
 
-        # 4단계: Pydantic 검증 후 yield
-        for raw in raw_sentences:
-            sentence_counter += 1
-            raw = {**raw, "sentence_id": sentence_counter}
-            try:
-                yield Sentence.model_validate(raw).model_dump()
-            except Exception as e:
-                logger.warning(
-                    "청크 #%d 스키마 검증 실패 (sentence_id=%d): %s",
-                    chunk_idx, sentence_counter, e,
-                )
-                yield raw
+        # 3단계: analyzed_words → Sentence 변환 후 yield
+        sentence_counter += 1
+        raw: dict = _words_to_sentence(analyzed_words, sentence_counter)
+        try:
+            yield Sentence.model_validate(raw).model_dump()
+        except Exception as e:
+            logger.warning(
+                "청크 #%d 스키마 검증 실패 (sentence_id=%d): %s",
+                chunk_idx, sentence_counter, e,
+            )
+            yield raw
 
 
 # ---------------------------------------------------------------------------
@@ -150,18 +141,11 @@ def run(video_path: str | Path) -> list[dict]:
             raise RuntimeError(f"파이프라인 실패 [음향 분석 단계]: {e}") from e
         logger.info("음향 분석 완료: %.1f초", time.time() - t0)
 
-        # 3단계: LLM 감정 추론
-        t0 = time.time()
-        try:
-            final_result = tag_emotions(analyzed_words)
-        except Exception as e:
-            raise RuntimeError(f"파이프라인 실패 [LLM 감정 추론 단계]: {e}") from e
-        logger.info("LLM 감정 추론 완료: %.1f초", time.time() - t0)
-
     finally:
         if tmp_audio is not None and tmp_audio.exists():
             tmp_audio.unlink()
 
+    final_result = [_words_to_sentence(analyzed_words, sentence_id=1)]
     validated = _validate(final_result)
 
     logger.info(
@@ -183,6 +167,18 @@ def save_result(result: list[dict], output_path: str) -> None:
 # ---------------------------------------------------------------------------
 # 내부 헬퍼
 # ---------------------------------------------------------------------------
+
+def _words_to_sentence(words: list[dict], sentence_id: int) -> dict:
+    """analyzed_words 목록을 Sentence 구조 dict로 조립한다."""
+    text = " ".join(w["word"] for w in words)
+    speaker = words[0].get("speaker", "Unknown") if words else "Unknown"
+    return {
+        "sentence_id": sentence_id,
+        "speaker": speaker,
+        "text": text,
+        "words": words,
+    }
+
 
 def _pcm_to_temp_wav(pcm_bytes: bytes) -> Path:
     """s16le raw PCM bytes를 16kHz mono WAV 임시 파일로 변환한다.

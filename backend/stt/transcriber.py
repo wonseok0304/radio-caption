@@ -51,8 +51,9 @@ def transcribe_stream(audio_chunk: bytes) -> list[dict]:
 
     segments, _ = _get_model().transcribe(
         audio_np,
+        language="ko",
         word_timestamps=True,
-        beam_size=5,
+        beam_size=1,
     )
 
     words: list[dict] = []
