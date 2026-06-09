@@ -1,0 +1,26 @@
+[project]
+name = "radio-caption"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "websockets",
+    "faster-whisper",
+    "librosa",
+    "ollama",
+    "pydantic>=2.0",
+    "python-dotenv",
+    "requests",
+    "ffmpeg-python",
+    "soundfile",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black",
+    "ruff",
+    "pytest",
+]
