@@ -141,17 +141,15 @@ def _build_user_prompt(sentences: list[list[dict]]) -> str:
 
 
 def _post_to_ollama(user_prompt: str) -> str:
-    """requests로 Ollama /api/chat 엔드포인트를 호출하고 content 문자열을 반환한다."""
+    """requests로 Ollama /api/generate 엔드포인트를 호출하고 response 문자열을 반환한다."""
     import requests  # 런타임 의존성 — 테스트 시 모킹 가능
 
-    url = f"{LLM_HOST}/api/chat"
+    url = f"{LLM_HOST}/api/generate"
     payload: dict[str, Any] = {
         "model": LLM_MODEL,
+        "system": _SYSTEM_PROMPT,
+        "prompt": user_prompt,
         "stream": False,
-        "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user",   "content": user_prompt},
-        ],
     }
 
     try:
@@ -163,9 +161,9 @@ def _post_to_ollama(user_prompt: str) -> str:
         raise ConnectionError(f"Ollama 요청 실패: {e}") from e
 
     body = resp.json()
-    content = body.get("message", {}).get("content")
+    content = body.get("response")
     if content is None:
-        raise ValueError(f"Ollama 응답에 message.content 없음: {body}")
+        raise ValueError(f"Ollama 응답에 response 없음: {body}")
     return content
 
 

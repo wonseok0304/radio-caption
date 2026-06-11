@@ -2,15 +2,21 @@
 
 import asyncio
 import logging
+import os
 import threading
 
+import ollama
 import requests as req
 import uvicorn
+from dotenv import load_dotenv
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from backend.pipeline.runner import run_stream
+
+load_dotenv()
+OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3:latest")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -39,6 +45,14 @@ class Channel(BaseModel):
     url: str
 
 
+class SentenceItem(BaseModel):
+    text: str
+
+
+class SummarizeRequest(BaseModel):
+    sentences: list[SentenceItem]
+
+
 # ---------------------------------------------------------------------------
 # 채널 목록
 # ---------------------------------------------------------------------------
@@ -60,6 +74,35 @@ _CHANNELS: list[Channel] = [
 # ---------------------------------------------------------------------------
 # REST 엔드포인트
 # ---------------------------------------------------------------------------
+
+def _call_ollama_summarize(text: str) -> str:
+    """ollama 라이브러리로 라디오 자막 요약을 반환한다."""
+    prompt = (
+        "반드시 한국어로만 답변해줘.\n"
+        "다음은 라디오 방송의 자막입니다.\n"
+        "핵심 내용을 3줄로 요약해줘.\n"
+        "각 줄은 '-'로 시작해줘.\n"
+        "다른 설명 없이 요약 3줄만 출력해줘.\n\n"
+        f"{text}"
+    )
+    try:
+        response = ollama.generate(model=OLLAMA_MODEL, prompt=prompt)
+        return response["response"].strip()
+    except Exception as exc:
+        logger.warning("요약 Ollama 호출 실패: %s", exc)
+        return "요약 중 오류가 발생했습니다."
+
+
+@app.post("/api/summarize")
+async def summarize(request: SummarizeRequest) -> dict:
+    """sentences의 text를 합쳐 Ollama로 3줄 요약을 생성한다."""
+    if not request.sentences:
+        return {"summary": "요약할 내용이 없습니다."}
+    combined = " ".join(s.text for s in request.sentences)
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, _call_ollama_summarize, combined)
+    return {"summary": result}
+
 
 @app.get("/api/channels", response_model=list[Channel])
 async def get_channels() -> list[Channel]:
